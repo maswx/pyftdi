@@ -98,9 +98,7 @@ class MdioPort:
            :raise MdioIOError: if device is not configured or input parameters
                               are invalid
         """
-        return self._controller.write(
-            self._address,
-            out=self._make_buffer(regaddr, out))
+        return self._controller.write(regaddr,out)
 
     def exchange(self, out: Union[bytes, bytearray, Iterable[int]] = b'',
                  readlen: int = 0,
@@ -175,7 +173,7 @@ class MdioController:
     MDIO_O_BIT         = 0x02    # AD1
     MDIO_I_BIT         = 0x04    # AD2
     PAYLOAD_MAX_LENGTH = 0xFF00  # 16 bits max (- spare for control)
-    MDIO_SLAVE_ADDRESS = 0x00
+    MDIO_SLAVE_ADDRESS = 0x11
     MDIO_MASK          = MDC_BIT | MDIO_O_BIT | MDIO_I_BIT
     MDIO_DIR           = MDC_BIT | MDIO_O_BIT #when 1: means output, else inport
 
@@ -208,78 +206,6 @@ class MdioController:
         self._read_optim    = True
 
 
-    def configure(self, url: Union[str, UsbDevice],
-                  **kwargs: Mapping[str, Any]) -> None:
-        """Configure the FTDI interface as a Mdio master.
-
-           :param url: FTDI URL string, such as ``ftdi://ftdi:232h/1``
-           :param kwargs: options to configure the MDIO bus
-
-           Accepted options:
-
-           * ``interface``: when URL is specifed as a USB device, the interface
-             named argument can be used to select a specific port of the FTDI
-             device, as an integer accessByClass22ing from 1.
-           * ``direction`` a bitfield specifying the FTDI GPIO direction,
-             where high level defines an output, and low level defines an
-             input. Only useful to setup default IOs at accessByClass22 up, use
-             :py:class:`MdioGpioPort` to drive GPIOs. Note that pins reserved
-             for MDIO feature take precedence over any this setting.
-           * ``initial`` a bitfield specifying the initial output value. Only
-             useful to setup default IOs at accessByClass22 up, use
-             :py:class:`MdioGpioPort` to drive GPIOs.
-           * ``frequency`` float value the MDIO bus frequency in Hz
-           * ``clockstretching`` boolean value to enable clockstreching.
-             xD7 (GPIO7) pin should be connected back to xD0 (SCK)
-           * ``debug`` to increase log verbosity, using MPSSE tracer
-        """
-        if 'frequency' in kwargs:
-            frequency = kwargs['frequency']
-            del kwargs['frequency']
-        else:
-            frequency = 2500000.0
-        if 'interface' in kwargs:
-            if isinstance(url, str):
-                raise MdioIOError('url and interface are mutually exclusive')
-            interface = int(kwargs['interface'])
-            del kwargs['interface']
-        else:
-            interface = 1
-        if 'rdoptim' in kwargs:
-            self._read_optim = to_bool(kwargs['rdoptim'])
-            del kwargs['rdoptim']
-        with self._lock:
-            self._mdio_mask = self.MDIO_MASK
-            # until the device is open, there is no way to tell if it has a
-            # wide (16) or narrow port (8). Lower API can deal with any, so
-            # delay any truncation till the device is actually open
-            self._set_gpio_direction(16, 0, 0)
-            # as 3-phase clock frequency mode is required for MDIO mode, the
-            # FTDI clock should be adapted to match the required frequency.
-            kwargs['direction'] = self.MDIO_DIR | self._gpio_dir
-            kwargs['initial'] = self.IDLE 
-            kwargs['frequency'] = (3.0*frequency)/2.0
-            if not isinstance(url, str):
-                frequency = self._ftdi.open_mpsse_from_device(
-                    url, interface=interface, **kwargs)
-            else:
-                frequency = self._ftdi.open_mpsse_from_url(url, **kwargs)
-            self._frequency = (2.0*frequency)/3.0
-            self._tx_size, self._rx_size = self._ftdi.fifo_sizes
-            self._ftdi.enable_adaptive_clock(False)
-            self._ftdi.enable_3phase_clock(True)
-            try:
-                self._ftdi.enable_drivezero_mode(self.MDC_BIT |
-                                                 self.MDIO_O_BIT |
-                                                 self.MDIO_I_BIT)
-            except FtdiFeatureError:
-                # when open collector feature is not available (FT2232, FT4232)
-                # SDA line is temporary move to high-z to enable ACK/NACK
-                # read back from slave
-                self._fake_tristate = True
-            self._wide_port = self._ftdi.has_wide_port
-            if not self._wide_port:
-                self._set_gpio_direction(8, 0, 0)
 
 
     def close(self, freeze: bool = False) -> None:
@@ -837,6 +763,18 @@ class MdioController:
         return (Ftdi.SET_BITS_LOW              ,  # ftdi command
                 self.MDC_BIT                   ,  # output value
                 self.MDIO_DIR                  )  # 1: output; 0: input
+    @property
+    def _clk_lo_data_hi_bitbang(self) :
+        return self.MDIO_O_BIT
+    @property
+    def _clk_hi_data_hi_bitbang(self) :
+        return self.MDIO_O_BIT | self.MDC_BIT
+    @property
+    def _clk_lo_data_lo_bitbang(self) :
+        return 0x0
+    @property
+    def _clk_hi_data_lo_bitbang(self) :
+        return self.MDC_BIT
 
     
     @property
@@ -845,9 +783,123 @@ class MdioController:
         for i in range(32):
             preamble += self._clk_lo_data_hi 
             preamble += self._clk_hi_data_hi 
+        preamble += self._clk_lo_data_lo 
+        preamble += self._clk_hi_data_lo 
+        preamble += self._clk_lo_data_hi 
+        preamble += self._clk_hi_data_hi 
+        preamble += self._clk_lo_data_lo 
+        preamble += self._clk_hi_data_lo 
+        preamble += self._clk_lo_data_hi 
+        preamble += self._clk_hi_data_hi 
         return preamble
 
-    def _do_write(self, out: Union[bytes, bytearray, Iterable[int]]):
+    @property
+    def _bitbang_clk_bit0(self) -> Tuple[int]:
+        return (self._clk_lo_data_lo_bitbang, 
+                self._clk_hi_data_lo_bitbang)
+    @property
+    def _bitbang_clk_bit1(self) -> Tuple[int]:
+        return (self._clk_lo_data_hi_bitbang, 
+                self._clk_hi_data_hi_bitbang)
+
+    @property
+    def _preamble_bitbang(self) -> Tuple[int]:
+        preamble = ()
+        for i in range(32):
+            preamble += self._bitbang_clk_bit1
+        return preamble
+    @property
+    def _mdio_end_bitbang(self) -> Tuple[int]:
+        idle = ()
+        idle += self._bitbang_clk_bit1
+        return idle
+        #return (self._clk_hi_data_hi_bitbang, 
+        #        self._clk_hi_data_hi_bitbang)
+         
+    def _gen_st_and_op_code_bitbang(self, st_code:int, op_code:int) -> Tuple[int]:
+        st_op_code = ()
+        if st_code == 0x0:
+            st_op_code += self._bitbang_clk_bit0
+            st_op_code += self._bitbang_clk_bit0
+        elif st_code == 0x1:
+            st_op_code += self._bitbang_clk_bit0
+            st_op_code += self._bitbang_clk_bit1
+        elif st_code == 0x2:
+            st_op_code += self._bitbang_clk_bit1
+            st_op_code += self._bitbang_clk_bit0
+        elif st_code == 0x3:
+            st_op_code += self._bitbang_clk_bit1
+            st_op_code += self._bitbang_clk_bit1
+        if op_code == 0x0:
+            st_op_code += self._bitbang_clk_bit0
+            st_op_code += self._bitbang_clk_bit0
+        elif op_code == 0x1:
+            st_op_code += self._bitbang_clk_bit0
+            st_op_code += self._bitbang_clk_bit1
+        elif op_code == 0x2:
+            st_op_code += self._bitbang_clk_bit1
+            st_op_code += self._bitbang_clk_bit0
+        elif op_code == 0x3:
+            st_op_code += self._bitbang_clk_bit1
+            st_op_code += self._bitbang_clk_bit1
+
+        return st_op_code
+
+    def _gen_devaddr_bitbang(self, devaddr:int) -> Tuple[int]:
+        devaddr_code = ()
+        for i in range(5):
+            if (devaddr >> (4-i)) & 0x1:
+                devaddr_code += self._bitbang_clk_bit1
+            else:
+                devaddr_code += self._bitbang_clk_bit0
+        return devaddr_code
+
+    def _gen_regaddr_bitbang(self, regaddr:int) -> Tuple[int]:
+        regaddr_code = ()
+        for i in range(5):
+            if (regaddr >> (4-i)) & 0x1:
+                regaddr_code += self._bitbang_clk_bit1
+            else:
+                regaddr_code += self._bitbang_clk_bit0
+        return regaddr_code
+
+    @property
+    def _gen_TA_bitbang(self) -> Tuple[int]:
+        TA = ()
+        TA += self._bitbang_clk_bit1
+        TA += self._bitbang_clk_bit0
+        return TA
+    
+    def _gen_mdio_16bit_data(self, data:int) -> Tuple[int]:
+        mdio_data = ()
+        for i in range(16):
+            if (data >> (15-i)) & 0x1:
+                mdio_data += self._bitbang_clk_bit1
+            else:
+                mdio_data += self._bitbang_clk_bit0
+        return mdio_data
+
+    def _gen_write_wave(self, st_code:int, op_code:int, devaddr:int, regaddr:int, data:int) -> Tuple[int]:
+        wave = ()
+        wave += self._preamble_bitbang
+        wave += self._gen_st_and_op_code_bitbang(st_code, op_code)
+        wave += self._gen_devaddr_bitbang(devaddr)
+        wave += self._gen_regaddr_bitbang(regaddr)
+        wave += self._gen_TA_bitbang
+        wave += self._gen_mdio_16bit_data(data)
+        wave += self._mdio_end_bitbang
+        return wave
+
+    #def _get_mdio_16bit_data(self, data:Tuple[int]) -> int:
+    #    mdio_data = 0
+    #    for i in range(16):
+    #        mdio_data = mdio_data >> 1
+    #        if data[i] & self.MDIO_I_BIT:
+    #            mdio_data |= 0x8000
+    #    return mdio_data
+
+
+    def _do_write(self, address:int, out: Union[bytes, bytearray, Iterable[int]]):
         if not isinstance(out, bytearray):
             out = bytearray(out)
         if not out:
@@ -855,7 +907,7 @@ class MdioController:
         self.log.debug('- write %d byte(s): %s',
                        len(out), hexlify(out).decode())
         for byte in out:
-            cmd = bytearray(self._preamble)
+            cmd = self._gen_write_wave(0x01, 0x01, self.MDIO_SLAVE_ADDRESS, address, byte)
             self._ftdi.write_data(cmd)
 
     def write(self, address: int, out: Union[bytes, bytearray, Iterable[int]]) -> None:
@@ -863,19 +915,89 @@ class MdioController:
         """
         if not self.configured:
             raise MdioIOError("FTDI controller not initialized")
-        self.validate_address(address)
-        if address is None:
-            mdioaddress = None
-        else:
-            mdioaddress = address
         with self._lock:
-            self._do_write(out)
+            self._do_write(address, out)
             return
 
+    def configure(self, url: Union[str, UsbDevice],
+                  **kwargs: Mapping[str, Any]) -> None:
+        """Configure the FTDI interface as a Mdio master.
+
+           :param url: FTDI URL string, such as ``ftdi://ftdi:232h/1``
+           :param kwargs: options to configure the MDIO bus
+
+           Accepted options:
+
+           * ``interface``: when URL is specifed as a USB device, the interface
+             named argument can be used to select a specific port of the FTDI
+             device, as an integer accessByClass22ing from 1.
+           * ``direction`` a bitfield specifying the FTDI GPIO direction,
+             where high level defines an output, and low level defines an
+             input. Only useful to setup default IOs at accessByClass22 up, use
+             :py:class:`MdioGpioPort` to drive GPIOs. Note that pins reserved
+             for MDIO feature take precedence over any this setting.
+           * ``initial`` a bitfield specifying the initial output value. Only
+             useful to setup default IOs at accessByClass22 up, use
+             :py:class:`MdioGpioPort` to drive GPIOs.
+           * ``frequency`` float value the MDIO bus frequency in Hz
+           * ``clockstretching`` boolean value to enable clockstreching.
+             xD7 (GPIO7) pin should be connected back to xD0 (SCK)
+           * ``debug`` to increase log verbosity, using MPSSE tracer
+        """
+        if 'frequency' in kwargs:
+            frequency = kwargs['frequency']
+            del kwargs['frequency']
+        else:
+            frequency = 100000.0
+        if 'interface' in kwargs:
+            if isinstance(url, str):
+                raise MdioIOError('url and interface are mutually exclusive')
+            interface = int(kwargs['interface'])
+            del kwargs['interface']
+        else:
+            interface = 1
+        if 'rdoptim' in kwargs:
+            self._read_optim = to_bool(kwargs['rdoptim'])
+            del kwargs['rdoptim']
+        with self._lock:
+            self._mdio_mask = self.MDIO_MASK
+            # until the device is open, there is no way to tell if it has a
+            # wide (16) or narrow port (8). Lower API can deal with any, so
+            # delay any truncation till the device is actually open
+            self._set_gpio_direction(16, 0, 0)
+            # as 3-phase clock frequency mode is required for MDIO mode, the
+            # FTDI clock should be adapted to match the required frequency.
+            kwargs['direction'] = self.MDIO_DIR | self._gpio_dir
+            kwargs['initial'] = self.IDLE 
+            kwargs['frequency'] = frequency#(3.0*frequency)/2.0
+            #frequency = self._ftdi.open_mpsse_from_url(url, **kwargs)
+            frequency = self._ftdi.open_bitbang_from_url(url, direction=self.MDIO_DIR,latency=120,baudrate=2500000,sync=True)
+
+    #def open_bitbang_from_url(self, url: str, direction: int = 0x0,
+    #                          latency: int = 16, baudrate: int = 1000000,
+    #                          sync: bool = False) -> float:
+
+            self._frequency = frequency #(2.0*frequency)/3.0
+            self._tx_size, self._rx_size = self._ftdi.fifo_sizes
+            #self._ftdi.enable_adaptive_clock(False)
+            #self._ftdi.set_baudrate(2500000)
+            #self._ftdi.enable_3phase_clock(False)
+            #try:
+            #    self._ftdi.enable_drivezero_mode(self.MDC_BIT |
+            #                                     self.MDIO_O_BIT |
+            #                                     self.MDIO_I_BIT)
+            #except FtdiFeatureError:
+            #    # when open collector feature is not available (FT2232, FT4232)
+            #    # SDA line is temporary move to high-z to enable ACK/NACK
+            #    # read back from slave
+            #self._fake_tristate = True
+            #self._wide_port = self._ftdi.has_wide_port
+            #if not self._wide_port:
+            #    self._set_gpio_direction(8, 0, 0)
 # 测试主函数
 if __name__ == '__main__':
     ctrl = MdioController()
     ctrl.configure('ftdi://ftdi:232h/1')
     mdio = ctrl.get_port(0x0)
     # send 2 bytes
-    mdio.write_to(0x001, [0x12, 0x34])
+    mdio.write_to(0x01, [0x12, 0x34])
